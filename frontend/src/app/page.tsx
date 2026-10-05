@@ -68,6 +68,7 @@ export default function Home() {
 
   const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
   const channelExpired = channelExpiresAt > 0n && channelExpiresAt <= nowSeconds;
+  const remainingEscrow = DEPOSIT - settledAmount;
 
   async function connectWallet() {
     setStatus("working");
@@ -387,7 +388,7 @@ export default function Home() {
       );
     } catch (error) {
       setStatus("error");
-      setMessage(errorMessage(error));
+      setMessage(refundErrorMessage(error));
     }
   }
 
@@ -452,8 +453,13 @@ export default function Home() {
                   {expired ? (
                     <>
                       <p className="hint" style={{ color: "var(--error, #e55)" }}>
-                        Voucher has expired. Settlement is no longer possible for this voucher.
-                        If the channel&apos;s own expiry has also passed, the payer can refund.
+                        Voucher has expired — settlement is no longer possible for this voucher.
+                        If the channel&apos;s own expiry has also passed, the original payer can
+                        recover any remaining escrow using the Refund button below.
+                      </p>
+                      <p className="hint">
+                        <b>Payer only:</b> connect the original payer account in Freighter to
+                        authorize the refund. Only the payer can reclaim escrow after expiry.
                       </p>
                       <button
                         className="primary-button"
@@ -506,10 +512,21 @@ export default function Home() {
             <div className="detail-row"><span>Payee</span><span>{payTo ? `${payTo.slice(0, 8)}...${payTo.slice(-5)}` : "Not configured"}</span></div>
             <div className="detail-row"><span>Deposit</span><span>{DEPOSIT.toString()} token units</span></div>
             <div className="detail-row"><span>Request price</span><span>{PRICE.toString()} token units</span></div>
+            {channelId && (
+              <>
+                <div className="detail-row"><span>Settled</span><span>{settledAmount.toString()} token units</span></div>
+                <div className="detail-row"><span>Remaining in escrow</span><span>{remainingEscrow.toString()} token units</span></div>
+              </>
+            )}
             {channelExpiresAt > 0n && (
               <div className="detail-row">
                 <span>Expires</span>
-                <span>{new Date(Number(channelExpiresAt) * 1000).toLocaleString()}</span>
+                <span>
+                  {new Date(Number(channelExpiresAt) * 1000).toLocaleString()}
+                  {channelExpired
+                    ? " — expired"
+                    : ` — in ${formatTimeRemaining(channelExpiresAt)}`}
+                </span>
               </div>
             )}
             <button className="primary-button" disabled={status === "working" || Boolean(channelId)} onClick={openChannel}>
@@ -521,18 +538,39 @@ export default function Home() {
               vouchers — it lives only in this tab. Signed vouchers are saved locally so the
               payee can settle even after a page refresh.
             </p>
+            {channelId && !channelExpired && (
+              <>
+                <div className="divider" />
+                <p className="hint">
+                  <b>Refunds:</b> Only the payer can request a refund. A refund is only possible
+                  after the channel expiry time. Until then, the payee can still settle any
+                  outstanding signed voucher.
+                </p>
+              </>
+            )}
             {channelId && channelExpired && (
               <>
                 <div className="divider" />
                 <p className="hint" style={{ color: "var(--error, #e55)" }}>
-                  This channel has expired. The payer can recover unclaimed escrow.
+                  This channel has expired.{" "}
+                  {remainingEscrow > 0n
+                    ? `${remainingEscrow.toString()} token units remain in escrow.`
+                    : "All deposited funds have already been settled."}
+                </p>
+                <p className="hint">
+                  <b>Payer only:</b> connect the original payer account in Freighter, then click
+                  Refund to recover the remaining escrow. The payee can no longer settle after
+                  the channel expires.
                 </p>
                 <button
                   className="primary-button"
-                  disabled={status === "working" || !wallet}
+                  disabled={status === "working" || !wallet || remainingEscrow <= 0n}
                   onClick={() => refundExpiredChannel(channelId)}
                 >
-                  Refund expired channel <span>↗</span>
+                  {remainingEscrow > 0n
+                    ? `Refund ${remainingEscrow.toString()} units to payer`
+                    : "Nothing to refund"}
+                  <span>↗</span>
                 </button>
               </>
             )}
@@ -559,6 +597,12 @@ export default function Home() {
               <div>
                 <span className="section-index">ON-CHAIN SETTLEMENT</span>
                 <strong>{settledAmount.toString()} <small>units settled</small></strong>
+                {channelId && (
+                  <div style={{ marginTop: "0.25rem" }}>
+                    <span className="section-index">REMAINING IN ESCROW</span>
+                    <strong>{remainingEscrow.toString()} <small>units</small></strong>
+                  </div>
+                )}
               </div>
               <button
                 className="settle-button"
@@ -628,4 +672,40 @@ async function waitForTransaction(server: rpc.Server, hash: string) {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Unexpected wallet or network error";
+}
+
+/**
+ * Returns a human-readable countdown string for a future unix timestamp (seconds).
+ * e.g. "23h 55m" or "5m 30s"
+ */
+function formatTimeRemaining(expiresAt: bigint): string {
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  const delta = expiresAt > nowSec ? expiresAt - nowSec : 0n;
+  const totalSec = Number(delta);
+  const days = Math.floor(totalSec / 86_400);
+  const hours = Math.floor((totalSec % 86_400) / 3_600);
+  const minutes = Math.floor((totalSec % 3_600) / 60);
+  const seconds = totalSec % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
+/**
+ * Produces a user-friendly error message for refund failures, distinguishing
+ * the ChannelStillActive contract error from other failures.
+ */
+function refundErrorMessage(error: unknown): string {
+  const msg = error instanceof Error ? error.message : "Unexpected wallet or network error";
+  if (msg.includes("ChannelStillActive") || msg.includes("(9)")) {
+    return (
+      "Refund rejected: the channel has not yet expired. " +
+      "Only the payer can request a refund, and only after the channel expiry time has passed."
+    );
+  }
+  if (msg.includes("NothingToRefund") || msg.includes("(12)")) {
+    return "Refund rejected: all deposited funds have already been settled — there is nothing left to refund.";
+  }
+  return msg;
 }

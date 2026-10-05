@@ -89,3 +89,41 @@ test file to sign vouchers with the deterministic test key. Mount additional
 routes via `makeApp()` or create a local Express instance for route-specific
 scenarios. Keep the in-memory `replayStore` (created fresh in `beforeEach`) so
 each test starts with a clean cursor state.
+
+## Frontend unit tests
+
+The frontend test suite lives under `frontend/src/lib/` and runs with Vitest:
+
+```bash
+npm ci --prefix frontend
+npm --prefix frontend test
+```
+
+| Test file | What it covers |
+| --- | --- |
+| `channel.test.ts` | `openChannelArgsToScVal` — Soroban struct encoding with correct symbol keys and types. |
+| `voucher.test.ts` | `voucherMessage` — canonical domain-separated byte layout for Ed25519 signing. |
+| `voucher-store.test.ts` | `saveVoucher`, `loadVoucher`, `clearVoucher`, `listStoredVouchers` — localStorage round-trips, isolation, recovery scenarios, and security (no private key in storage). |
+| `expiry-refund.test.ts` | `formatTimeRemaining`, `refundErrorMessage`, `channelExpired`, `remainingEscrow` — expiry countdown display, `ChannelStillActive` / `NothingToRefund` error messages, payer-only refund logic, and recovery-panel expired-voucher detection. |
+
+### Expiry and refund tests in detail
+
+`expiry-refund.test.ts` verifies:
+
+- **`formatTimeRemaining`** — displays days+hours, hours+minutes, minutes+seconds,
+  or seconds only depending on the remaining delta; returns "0s" for already-expired timestamps.
+- **`refundErrorMessage`** — maps `ChannelStillActive` (by name or error code 9) to a
+  payer-focused explanation; maps `NothingToRefund` (by name or code 12) to a
+  fully-settled explanation; passes unrecognized errors through unchanged; handles
+  non-Error values and null safely.
+- **`channelExpired`** — returns false for a zero timestamp (no channel), false for a
+  future timestamp, true for a past timestamp, and true when the expiry equals the
+  current second (contract condition is `timestamp > expires_at`, so equal = expired).
+- **`remainingEscrow`** — equals the full deposit when nothing is settled, decreases
+  proportionally, and reaches zero when fully settled.
+- **Recovery-panel expired-voucher detection** — `validUntil` in the past marks the
+  voucher as expired; `validUntil` in the future does not; a scenario where the voucher
+  is expired but the channel is still active correctly identifies that neither the payee
+  (cannot settle) nor the payer (cannot yet refund) can act immediately.
+
+See [expiry-and-refund.md](./expiry-and-refund.md) for the full user-facing documentation.
