@@ -26,6 +26,7 @@ import request from "supertest";
 import { getPublicKeyAsync, signAsync } from "@noble/ed25519";
 import {
   createPaymentMiddleware,
+  parseEndpointRequirements,
   SqliteReplayStore,
   voucherMessage,
 } from "../src/payment.js";
@@ -690,6 +691,584 @@ describe("x402 payment middleware", () => {
 
       expect(response.body.data).toMatch(/Access granted/);
       expect(response.body.network).toBe("stellar:testnet");
+    });
+  });
+});
+
+// ─── Per-endpoint payment requirement tests ──────────────────────────────────
+//
+// These tests exercise the parseEndpointRequirements validator and the
+// per-endpoint middleware wiring:
+//
+//  • parseEndpointRequirements – accepts well-formed JSON, rejects every
+//    invalid shape (non-array, bad types, empty strings, negative amounts,
+//    zero amounts, non-/ paths, duplicate paths, non-JSON input).
+//  • Per-endpoint 402 challenge – the PAYMENT-REQUIRED header reflects the
+//    price and token for *that specific route*, not a different one.
+//  • Wrong asset rejection – a voucher citing the wrong token address is
+//    rejected even when the amount and signature are otherwise valid.
+//  • Wrong amount rejection – a voucher with a valid signature but the wrong
+//    price for this route is rejected.
+//  • Two routes, different prices – both routes are independently gated at
+//    their own prices and neither accepts the other's voucher.
+
+// ── A second token address and higher price for multi-route tests ─────────────
+
+const altTokenAddress = `C${"E".repeat(55)}`;
+const PRICE_HIGH = 500n;
+
+/**
+ * Build a signed payment header that references a specific token and price.
+ * Mirrors buildSignedHeader but allows overriding the asset / amount declared
+ * in the `accepted` object independently of the voucher signature.
+ */
+async function buildSignedHeaderFor(
+  nonce: string | bigint,
+  cumulativeAmount: string | bigint,
+  opts: {
+    validUntil?: bigint;
+    signingKey?: Uint8Array;
+    /** Token address to put in the `accepted.asset` field. */
+    declaredAsset?: string;
+    /** Price string to put in the `accepted.amount` field. */
+    declaredAmount?: string;
+  } = {},
+): Promise<string> {
+  const validUntil = opts.validUntil ?? expiresAt - 1n;
+  const signingKey = opts.signingKey ?? secretKey;
+  const declaredAsset = opts.declaredAsset ?? tokenAddress;
+  const declaredAmount = opts.declaredAmount ?? PRICE.toString();
+
+  const message = voucherMessage(
+    networkPassphrase,
+    contractId,
+    BigInt(channelId),
+    BigInt(cumulativeAmount),
+    BigInt(nonce),
+    validUntil,
+  );
+  const signature = await signAsync(message, signingKey);
+
+  return Buffer.from(
+    JSON.stringify({
+      x402Version: 2,
+      accepted: {
+        scheme: "stellar-channel",
+        network: "stellar:testnet",
+        asset: declaredAsset,
+        amount: declaredAmount,
+        payTo,
+      },
+      payload: {
+        channelId,
+        cumulativeAmount: cumulativeAmount.toString(),
+        nonce: nonce.toString(),
+        validUntil: validUntil.toString(),
+        signature: Buffer.from(signature).toString("hex"),
+      },
+    }),
+  ).toString("base64");
+}
+
+/**
+ * Build an Express app with two independently-priced paid routes:
+ *   GET /paid/low   – PRICE (5 units) of tokenAddress
+ *   GET /paid/high  – PRICE_HIGH (500 units) of altTokenAddress
+ *
+ * Both share the same channel snapshot (publicKey, DEPOSITED, etc.).
+ */
+function makeTwoRouteApp(
+  overrides: Partial<{
+    deposited: bigint;
+    settled: bigint;
+    lastNonce: bigint;
+    expiresAt: bigint;
+    voucherKey: Uint8Array;
+  }> = {},
+) {
+  const snapshot = {
+    payer: payTo,
+    payee: payTo,
+    token: tokenAddress,
+    voucherKey: publicKey,
+    deposited: DEPOSITED,
+    settled: 0n,
+    lastNonce: 0n,
+    expiresAt,
+    ...overrides,
+  };
+
+  const server = express();
+
+  // Low-priced route (PRICE units of tokenAddress).
+  server.get(
+    "/paid/low",
+    createPaymentMiddleware({
+      network: "stellar:testnet",
+      networkPassphrase,
+      contractId,
+      tokenAddress,
+      payTo,
+      amount: PRICE,
+      description: "Low-price endpoint",
+      mimeType: "application/json",
+      loadChannel: async () => snapshot,
+      replayStore,
+    }),
+    (_req, res) => res.json({ route: "low" }),
+  );
+
+  // High-priced route (PRICE_HIGH units of altTokenAddress).
+  server.get(
+    "/paid/high",
+    createPaymentMiddleware({
+      network: "stellar:testnet",
+      networkPassphrase,
+      contractId,
+      tokenAddress: altTokenAddress,
+      payTo,
+      amount: PRICE_HIGH,
+      description: "High-price endpoint",
+      mimeType: "application/json",
+      loadChannel: async () => ({ ...snapshot, token: altTokenAddress }),
+      replayStore,
+    }),
+    (_req, res) => res.json({ route: "high" }),
+  );
+
+  return server;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("parseEndpointRequirements", () => {
+  // ── Happy path ──────────────────────────────────────────────────────────────
+
+  it("returns an empty array for undefined input", () => {
+    expect(parseEndpointRequirements(undefined)).toEqual([]);
+  });
+
+  it("returns an empty array for an empty string", () => {
+    expect(parseEndpointRequirements("")).toEqual([]);
+  });
+
+  it("returns an empty array for whitespace-only input", () => {
+    expect(parseEndpointRequirements("   ")).toEqual([]);
+  });
+
+  it("parses a single valid endpoint requirement", () => {
+    const raw = JSON.stringify([
+      {
+        path: "/paid/data",
+        amount: "100",
+        tokenAddress: `C${"A".repeat(55)}`,
+        description: "Metered data",
+        mimeType: "application/json",
+      },
+    ]);
+    const result = parseEndpointRequirements(raw);
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("/paid/data");
+    expect(result[0].amount).toBe(100n);
+    expect(result[0].description).toBe("Metered data");
+    expect(result[0].mimeType).toBe("application/json");
+  });
+
+  it("parses multiple valid endpoint requirements", () => {
+    const raw = JSON.stringify([
+      {
+        path: "/paid/a",
+        amount: "50",
+        tokenAddress: `C${"A".repeat(55)}`,
+        description: "Route A",
+        mimeType: "application/json",
+      },
+      {
+        path: "/paid/b",
+        amount: "200",
+        tokenAddress: `C${"B".repeat(55)}`,
+        description: "Route B",
+        mimeType: "text/plain",
+      },
+    ]);
+    const result = parseEndpointRequirements(raw);
+    expect(result).toHaveLength(2);
+    expect(result[0].amount).toBe(50n);
+    expect(result[1].amount).toBe(200n);
+  });
+
+  it("converts amount strings to BigInt values", () => {
+    const raw = JSON.stringify([
+      {
+        path: "/paid/big",
+        amount: "999999999999999999",
+        tokenAddress: `C${"A".repeat(55)}`,
+        description: "Big price",
+        mimeType: "application/json",
+      },
+    ]);
+    const [endpoint] = parseEndpointRequirements(raw);
+    expect(endpoint.amount).toBe(999_999_999_999_999_999n);
+  });
+
+  // ── JSON parsing errors ──────────────────────────────────────────────────────
+
+  it("throws on non-JSON input", () => {
+    expect(() => parseEndpointRequirements("not json")).toThrow(
+      "ENDPOINT_REQUIREMENTS is not valid JSON",
+    );
+  });
+
+  it("throws when the top-level value is a JSON object, not an array", () => {
+    expect(() => parseEndpointRequirements("{}")).toThrow(
+      "ENDPOINT_REQUIREMENTS must be a JSON array",
+    );
+  });
+
+  it("throws when the top-level value is a JSON string, not an array", () => {
+    expect(() => parseEndpointRequirements('"hello"')).toThrow(
+      "ENDPOINT_REQUIREMENTS must be a JSON array",
+    );
+  });
+
+  // ── Per-element validation errors ────────────────────────────────────────────
+
+  it("throws when an element is not an object", () => {
+    const raw = JSON.stringify(["not-an-object"]);
+    expect(() => parseEndpointRequirements(raw)).toThrow(
+      "each element must be a JSON object",
+    );
+  });
+
+  it("throws when path is missing", () => {
+    const raw = JSON.stringify([
+      { amount: "100", tokenAddress: `C${"A".repeat(55)}`, description: "d", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow('field "path"');
+  });
+
+  it("throws when path is an empty string", () => {
+    const raw = JSON.stringify([
+      { path: "", amount: "100", tokenAddress: `C${"A".repeat(55)}`, description: "d", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow('field "path"');
+  });
+
+  it("throws when path does not start with /", () => {
+    const raw = JSON.stringify([
+      { path: "paid/data", amount: "100", tokenAddress: `C${"A".repeat(55)}`, description: "d", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow('path must start with "/"');
+  });
+
+  it("throws when amount is missing", () => {
+    const raw = JSON.stringify([
+      { path: "/paid/data", tokenAddress: `C${"A".repeat(55)}`, description: "d", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow('field "amount"');
+  });
+
+  it("throws when amount is zero", () => {
+    const raw = JSON.stringify([
+      { path: "/paid/data", amount: "0", tokenAddress: `C${"A".repeat(55)}`, description: "d", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow("positive integer");
+  });
+
+  it("throws when amount is negative", () => {
+    const raw = JSON.stringify([
+      { path: "/paid/data", amount: "-1", tokenAddress: `C${"A".repeat(55)}`, description: "d", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow("positive integer");
+  });
+
+  it("throws when amount has a leading zero", () => {
+    const raw = JSON.stringify([
+      { path: "/paid/data", amount: "010", tokenAddress: `C${"A".repeat(55)}`, description: "d", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow("positive integer");
+  });
+
+  it("throws when amount is a decimal string", () => {
+    const raw = JSON.stringify([
+      { path: "/paid/data", amount: "1.5", tokenAddress: `C${"A".repeat(55)}`, description: "d", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow("positive integer");
+  });
+
+  it("throws when amount is a number, not a string", () => {
+    const raw = JSON.stringify([
+      { path: "/paid/data", amount: 100, tokenAddress: `C${"A".repeat(55)}`, description: "d", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow('field "amount"');
+  });
+
+  it("throws when tokenAddress is missing", () => {
+    const raw = JSON.stringify([
+      { path: "/paid/data", amount: "100", description: "d", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow('field "tokenAddress"');
+  });
+
+  it("throws when description is an empty string", () => {
+    const raw = JSON.stringify([
+      { path: "/paid/data", amount: "100", tokenAddress: `C${"A".repeat(55)}`, description: "", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow('field "description"');
+  });
+
+  it("throws when mimeType is missing", () => {
+    const raw = JSON.stringify([
+      { path: "/paid/data", amount: "100", tokenAddress: `C${"A".repeat(55)}`, description: "d" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow('field "mimeType"');
+  });
+
+  it("throws on duplicate paths", () => {
+    const raw = JSON.stringify([
+      { path: "/paid/data", amount: "100", tokenAddress: `C${"A".repeat(55)}`, description: "d", mimeType: "m" },
+      { path: "/paid/data", amount: "200", tokenAddress: `C${"B".repeat(55)}`, description: "d2", mimeType: "m" },
+    ]);
+    expect(() => parseEndpointRequirements(raw)).toThrow('duplicate path "/paid/data"');
+  });
+});
+
+// ─── Per-endpoint middleware behaviour ───────────────────────────────────────
+
+describe("per-endpoint payment requirements", () => {
+  // ── 402 challenge reflects the correct per-route price ───────────────────────
+
+  describe("endpoint-specific 402 challenges", () => {
+    it("returns the low price in PAYMENT-REQUIRED for the low-priced route", async () => {
+      const response = await request(makeTwoRouteApp()).get("/paid/low").expect(402);
+      const raw = response.headers["payment-required"];
+      const required = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+      expect(required.accepts[0].amount).toBe(PRICE.toString());
+      expect(required.accepts[0].asset).toBe(tokenAddress);
+    });
+
+    it("returns the high price in PAYMENT-REQUIRED for the high-priced route", async () => {
+      const response = await request(makeTwoRouteApp()).get("/paid/high").expect(402);
+      const raw = response.headers["payment-required"];
+      const required = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+      expect(required.accepts[0].amount).toBe(PRICE_HIGH.toString());
+      expect(required.accepts[0].asset).toBe(altTokenAddress);
+    });
+
+    it("PAYMENT-REQUIRED resource.description matches the per-route description", async () => {
+      const response = await request(makeTwoRouteApp()).get("/paid/low").expect(402);
+      const raw = response.headers["payment-required"];
+      const required = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+      expect(required.resource.description).toBe("Low-price endpoint");
+    });
+
+    it("PAYMENT-REQUIRED resource.url contains the requested path", async () => {
+      const response = await request(makeTwoRouteApp()).get("/paid/high").expect(402);
+      const raw = response.headers["payment-required"];
+      const required = JSON.parse(Buffer.from(raw, "base64").toString("utf8"));
+      expect(required.resource.url).toMatch("/paid/high");
+    });
+  });
+
+  // ── Wrong asset rejection ────────────────────────────────────────────────────
+
+  describe("wrong asset rejection", () => {
+    it("rejects a voucher citing the wrong token address (right amount, valid signature)", async () => {
+      // The /paid/low route requires tokenAddress; present altTokenAddress instead.
+      const header = await buildSignedHeaderFor("1", PRICE, {
+        declaredAsset: altTokenAddress,
+      });
+      await request(makeTwoRouteApp())
+        .get("/paid/low")
+        .set("PAYMENT-SIGNATURE", header)
+        .expect(400);
+    });
+
+    it("rejects a voucher that omits the asset field entirely (malformed)", async () => {
+      const valid = await buildSignedHeaderFor("1", PRICE);
+      const decoded = JSON.parse(Buffer.from(valid, "base64").toString());
+      delete decoded.accepted.asset;
+      const bad = Buffer.from(JSON.stringify(decoded)).toString("base64");
+      await request(makeTwoRouteApp())
+        .get("/paid/low")
+        .set("PAYMENT-SIGNATURE", bad)
+        .expect(400);
+    });
+  });
+
+  // ── Wrong amount rejection ───────────────────────────────────────────────────
+
+  describe("wrong amount rejection", () => {
+    it("rejects a voucher declaring the high price on the low-priced route", async () => {
+      // Voucher says amount = PRICE_HIGH but the route expects PRICE.
+      const header = await buildSignedHeaderFor("1", PRICE_HIGH, {
+        declaredAmount: PRICE_HIGH.toString(),
+      });
+      await request(makeTwoRouteApp())
+        .get("/paid/low")
+        .set("PAYMENT-SIGNATURE", header)
+        .expect(400);
+    });
+
+    it("rejects a voucher with amount=0 (invalid regardless of asset)", async () => {
+      const header = await buildSignedHeaderFor("1", "0", {
+        declaredAmount: "0",
+      });
+      await request(makeTwoRouteApp())
+        .get("/paid/low")
+        .set("PAYMENT-SIGNATURE", header)
+        .expect(400);
+    });
+
+    it("rejects a voucher where the declared amount does not match the signed amount", async () => {
+      // Sign nonce=1 / cumulative=PRICE, but declare amount=PRICE*2 in accepted.
+      const header = await buildSignedHeaderFor("1", PRICE, {
+        declaredAmount: (PRICE * 2n).toString(),
+      });
+      await request(makeTwoRouteApp())
+        .get("/paid/low")
+        .set("PAYMENT-SIGNATURE", header)
+        .expect(400);
+    });
+  });
+
+  // ── Cross-endpoint voucher isolation ─────────────────────────────────────────
+
+  describe("cross-endpoint voucher isolation", () => {
+    it("accepts a correct low-price voucher on /paid/low", async () => {
+      const header = await buildSignedHeaderFor("1", PRICE, {
+        declaredAsset: tokenAddress,
+        declaredAmount: PRICE.toString(),
+      });
+      await request(makeTwoRouteApp())
+        .get("/paid/low")
+        .set("PAYMENT-SIGNATURE", header)
+        .expect(200);
+    });
+
+    it("rejects a low-price voucher on the high-priced /paid/high route", async () => {
+      // Correct asset + amount for /paid/low, but wrong for /paid/high.
+      const header = await buildSignedHeaderFor("1", PRICE, {
+        declaredAsset: tokenAddress,
+        declaredAmount: PRICE.toString(),
+      });
+      await request(makeTwoRouteApp())
+        .get("/paid/high")
+        .set("PAYMENT-SIGNATURE", header)
+        .expect(400);
+    });
+
+    it("rejects a high-price voucher on the low-priced /paid/low route", async () => {
+      // Correct asset + amount for /paid/high, but wrong for /paid/low.
+      const header = await buildSignedHeaderFor("1", PRICE_HIGH, {
+        declaredAsset: altTokenAddress,
+        declaredAmount: PRICE_HIGH.toString(),
+      });
+      await request(makeTwoRouteApp())
+        .get("/paid/low")
+        .set("PAYMENT-SIGNATURE", header)
+        .expect(400);
+    });
+
+    it("both routes return 200 independently with their own correct vouchers", async () => {
+      // Each route uses its own channel ID (different payer channels) so the
+      // SQLite replay cursors are independent and do not interfere.
+      const lowChannelId = "7";
+      const highChannelId = "8";
+
+      // Snapshot builder for a given channel ID.
+      const makeSnapshot = (token: string) => ({
+        payer: payTo,
+        payee: payTo,
+        token,
+        voucherKey: publicKey,
+        deposited: DEPOSITED,
+        settled: 0n,
+        lastNonce: 0n,
+        expiresAt,
+      });
+
+      const server = express();
+
+      server.get(
+        "/paid/low",
+        createPaymentMiddleware({
+          network: "stellar:testnet",
+          networkPassphrase,
+          contractId,
+          tokenAddress,
+          payTo,
+          amount: PRICE,
+          description: "Low-price endpoint",
+          mimeType: "application/json",
+          loadChannel: async () => makeSnapshot(tokenAddress),
+          replayStore,
+        }),
+        (_req, res) => res.json({ route: "low" }),
+      );
+
+      server.get(
+        "/paid/high",
+        createPaymentMiddleware({
+          network: "stellar:testnet",
+          networkPassphrase,
+          contractId,
+          tokenAddress: altTokenAddress,
+          payTo,
+          amount: PRICE_HIGH,
+          description: "High-price endpoint",
+          mimeType: "application/json",
+          loadChannel: async () => makeSnapshot(altTokenAddress),
+          replayStore,
+        }),
+        (_req, res) => res.json({ route: "high" }),
+      );
+
+      // Build a voucher for channel lowChannelId and the low-price route.
+      const lowMessage = voucherMessage(
+        networkPassphrase,
+        contractId,
+        BigInt(lowChannelId),
+        PRICE,
+        1n,
+        expiresAt - 1n,
+      );
+      const lowSig = await signAsync(lowMessage, secretKey);
+      const lowHeader = Buffer.from(
+        JSON.stringify({
+          x402Version: 2,
+          accepted: { scheme: "stellar-channel", network: "stellar:testnet", asset: tokenAddress, amount: PRICE.toString(), payTo },
+          payload: { channelId: lowChannelId, cumulativeAmount: PRICE.toString(), nonce: "1", validUntil: (expiresAt - 1n).toString(), signature: Buffer.from(lowSig).toString("hex") },
+        }),
+      ).toString("base64");
+
+      await request(server)
+        .get("/paid/low")
+        .set("PAYMENT-SIGNATURE", lowHeader)
+        .expect(200);
+
+      // Build a voucher for channel highChannelId and the high-price route.
+      const highMessage = voucherMessage(
+        networkPassphrase,
+        contractId,
+        BigInt(highChannelId),
+        PRICE_HIGH,
+        1n,
+        expiresAt - 1n,
+      );
+      const highSig = await signAsync(highMessage, secretKey);
+      const highHeader = Buffer.from(
+        JSON.stringify({
+          x402Version: 2,
+          accepted: { scheme: "stellar-channel", network: "stellar:testnet", asset: altTokenAddress, amount: PRICE_HIGH.toString(), payTo },
+          payload: { channelId: highChannelId, cumulativeAmount: PRICE_HIGH.toString(), nonce: "1", validUntil: (expiresAt - 1n).toString(), signature: Buffer.from(highSig).toString("hex") },
+        }),
+      ).toString("base64");
+
+      await request(server)
+        .get("/paid/high")
+        .set("PAYMENT-SIGNATURE", highHeader)
+        .expect(200);
     });
   });
 });

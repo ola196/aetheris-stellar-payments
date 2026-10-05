@@ -32,7 +32,7 @@ build step confirms there are no type errors before the suite runs.
 
 ## What the tests cover
 
-The suite is in `server/test/payment.test.ts` and is organised into eight
+The suite is in `server/test/payment.test.ts` and is organised into ten
 groups:
 
 | Group | Description |
@@ -47,20 +47,22 @@ groups:
 | `multi-step cumulative voucher sequence` | Three sequential vouchers with strictly incrementing nonces and amounts are all accepted; the `PAYMENT-RESPONSE` at each step reflects the correct nonce and running total; a gap in the amount sequence is rejected without corrupting the cursor. |
 | `/health endpoint` | The `/health` route returns HTTP 200 and `{"status":"ok"}` with no payment required. |
 | `paid data route gate` | A separate `/paid/data`-style route (matching the production route in `src/index.ts`) returns HTTP 402 without a payment header and HTTP 200 with a valid voucher, mirroring real production behaviour. |
+| `parseEndpointRequirements` | Unit-tests for the startup validator: empty / whitespace input, single and multiple valid entries, BigInt conversion, and 13 rejection cases covering non-JSON, non-array, missing fields, empty strings, zero/negative/decimal/leading-zero/non-string amounts, paths that don't start with `/`, and duplicate paths. |
+| `per-endpoint payment requirements` | Integration tests for per-route middleware wiring: PAYMENT-REQUIRED reflects the correct price and token for each route; wrong asset and wrong amount are rejected (HTTP 400); a low-price voucher is rejected on a high-priced route and vice versa; both routes independently accept correct vouchers using separate channel IDs. |
 
 ## Interpreting results
 
 A successful run looks like this:
 
 ```
-✓ test/payment.test.ts (33 tests) 270ms
+✓ test/payment.test.ts (69 tests) 347ms
 
 Test Files  1 passed (1)
-      Tests  33 passed (33)
-   Duration  ~700ms
+      Tests  69 passed (69)
+   Duration  ~800ms
 ```
 
-All 33 tests must pass. The suite is deterministic and does not depend on
+All 69 tests must pass. The suite is deterministic and does not depend on
 network access, environment variables, or timing beyond a 600-second voucher
 expiry window.
 
