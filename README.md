@@ -94,10 +94,15 @@ npm.cmd --prefix frontend test
 npm.cmd --prefix frontend run build
 ```
 
-The Express/Supertest tests exercise the 402 challenge, a valid signed
-voucher, replay rejection, and invalid-signature handling. Contract tests
-exercise deposits, cumulative settlement, replay/overdraw rejection, refunds,
-and the pause switch.
+The Express/Supertest integration tests cover the full x402 payment flow
+without a live Testnet: the 402 challenge and payment requirements, valid
+signed-voucher acceptance with PAYMENT-RESPONSE header verification, replay
+and out-of-order nonce rejection, invalid and tampered signature rejection,
+malformed header rejection, expired voucher rejection, and multi-step
+cumulative voucher sequences. See [docs/testing.md](./docs/testing.md) for
+a full description of every test scenario and how to run them locally.
+Contract tests exercise deposits, cumulative settlement, replay/overdraw
+rejection, refunds, and the pause switch.
 
 ## Local configuration
 
