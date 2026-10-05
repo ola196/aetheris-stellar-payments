@@ -196,6 +196,28 @@ address, then restart both processes and open a **new** channel. A channel's
 payee cannot be changed after it is opened. The dashboard keeps the delegate
 key and latest signed voucher in memory; keep the tab open through settlement.
 
+## Reviewer walkthrough
+
+Use Stellar Testnet and a small amount of test funds. The dashboard and server
+must be configured for the same contract, token, payee, and request price.
+
+1. **Connect Freighter.** Switch Freighter to Testnet and connect it to the
+   dashboard. Confirm the dashboard shows your connected public address.
+2. **Open a channel.** Enter the channel details and open it. Confirm the
+   dashboard shows the new channel and its deposited amount.
+3. **Make a paid request.** Use the dashboard to call the example paid API.
+   Without payment, the API responds with HTTP `402 Payment Required`. The
+   dashboard then creates a signed voucher for the request.
+4. **Settle the voucher.** Keep the dashboard tab open while the voucher is
+   waiting to be settled. Use the payee account in Freighter to submit the
+   settlement transaction.
+5. **Check the result.** Confirm the dashboard shows the settlement, then open
+   the transaction in Stellar Testnet Explorer to verify it was recorded.
+
+The dashboard keeps its temporary voucher-signing key and pending voucher in
+browser memory. They are not saved as private keys in local storage, so keep the
+tab open until settlement is complete.
+
 ## Testnet deployment
 
 First create/fund a Stellar CLI identity and arrange a compatible Testnet token
