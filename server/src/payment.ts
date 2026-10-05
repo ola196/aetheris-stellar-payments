@@ -8,6 +8,135 @@ export const PAYMENT_HEADER = "PAYMENT-SIGNATURE";
 export const REQUIRED_HEADER = "PAYMENT-REQUIRED";
 export const RESPONSE_HEADER = "PAYMENT-RESPONSE";
 
+/**
+ * Per-endpoint payment requirement.
+ *
+ * Each protected route can override the global defaults for amount, token
+ * address, description, and MIME type.  `path` is matched against the
+ * Express `req.path` value (e.g. `"/paid/data"`).
+ *
+ * All fields are required so configuration is explicit and auditable:
+ * silent inheritance of a global default could lead to under-priced routes
+ * going unnoticed in production.
+ */
+export interface EndpointRequirement {
+  /** Express path to protect, e.g. `"/paid/data"`. */
+  path: string;
+  /** Price per call in smallest token units (must be ≥ 1). */
+  amount: bigint;
+  /** Stellar contract address of the accepted token (`C…`). */
+  tokenAddress: string;
+  /** Human-readable description returned in the 402 resource object. */
+  description: string;
+  /** MIME type returned in the 402 resource object. */
+  mimeType: string;
+}
+
+/**
+ * Parsed shape of one element from the `ENDPOINT_REQUIREMENTS` JSON array.
+ * Values are strings before bigint/address validation.
+ */
+interface RawEndpointRequirement {
+  path: string;
+  amount: string;
+  tokenAddress: string;
+  description: string;
+  mimeType: string;
+}
+
+/**
+ * Parse and validate the `ENDPOINT_REQUIREMENTS` environment variable.
+ *
+ * Expected format: a JSON array of objects:
+ * ```json
+ * [
+ *   {
+ *     "path": "/paid/data",
+ *     "amount": "100",
+ *     "tokenAddress": "C...",
+ *     "description": "Metered data endpoint",
+ *     "mimeType": "application/json"
+ *   }
+ * ]
+ * ```
+ *
+ * Validation rules:
+ * - Must be a valid JSON array (non-empty).
+ * - Each element must have all five required string fields.
+ * - `path` must start with `/`.
+ * - `amount` must be a positive integer string (no leading zeros, ≥ 1).
+ * - `tokenAddress` must be a non-empty string (contract address format is
+ *    not re-checked here; the Soroban reader will reject unknown contracts).
+ * - `description` and `mimeType` must be non-empty strings.
+ * - Duplicate paths are rejected.
+ *
+ * Throws `Error` with a descriptive message on any validation failure.
+ * Returns an empty array when `raw` is `undefined` or an empty string.
+ */
+export function parseEndpointRequirements(raw: string | undefined): EndpointRequirement[] {
+  if (raw === undefined || raw.trim() === "") return [];
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("ENDPOINT_REQUIREMENTS is not valid JSON");
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error("ENDPOINT_REQUIREMENTS must be a JSON array");
+  }
+
+  const seen = new Set<string>();
+  const results: EndpointRequirement[] = [];
+
+  for (let index = 0; index < parsed.length; index++) {
+    const item = parsed[index];
+    const prefix = `ENDPOINT_REQUIREMENTS[${index}]`;
+
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new Error(`${prefix}: each element must be a JSON object`);
+    }
+
+    const entry = item as Record<string, unknown>;
+
+    for (const field of ["path", "amount", "tokenAddress", "description", "mimeType"] as const) {
+      if (typeof entry[field] !== "string" || (entry[field] as string).trim() === "") {
+        throw new Error(`${prefix}: field "${field}" must be a non-empty string`);
+      }
+    }
+
+    const { path, amount: amountStr, tokenAddress, description, mimeType } =
+      entry as unknown as RawEndpointRequirement;
+
+    if (!path.startsWith("/")) {
+      throw new Error(`${prefix}: path must start with "/" (got "${path}")`);
+    }
+
+    if (!/^[1-9][0-9]*$/.test(amountStr)) {
+      throw new Error(
+        `${prefix}: amount must be a positive integer string without leading zeros (got "${amountStr}")`,
+      );
+    }
+
+    const amount = BigInt(amountStr);
+    // Belt-and-suspenders: regex already guarantees amount ≥ 1, but keep
+    // explicit guard so the type contract is clear at call sites.
+    if (amount <= 0n) {
+      throw new Error(`${prefix}: amount must be greater than zero`);
+    }
+
+    if (seen.has(path)) {
+      throw new Error(`${prefix}: duplicate path "${path}" in ENDPOINT_REQUIREMENTS`);
+    }
+    seen.add(path);
+
+    results.push({ path, amount, tokenAddress: tokenAddress.trim(), description, mimeType });
+  }
+
+  return results;
+}
+
 export interface ChannelSnapshot {
   payer: string;
   payee: string;

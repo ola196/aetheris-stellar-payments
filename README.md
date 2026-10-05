@@ -123,8 +123,51 @@ Set these values before starting the server:
 | `SOROBAN_SOURCE_ACCOUNT` | Public Testnet account used to simulate read-only channel queries |
 | `STELLAR_RPC_URL` | Soroban RPC URL (defaults to Testnet) |
 | `FRONTEND_ORIGINS` | Comma-separated exact browser origins allowed by CORS |
-| `REQUEST_PRICE` | Smallest token units charged per API call; default `100` |
+| `REQUEST_PRICE` | Smallest token units charged per API call; default `100`. Used only when `ENDPOINT_REQUIREMENTS` is not set. |
 | `REPLAY_DATABASE` | Local SQLite cursor path; default `./data/replay.sqlite` |
+| `ENDPOINT_REQUIREMENTS` | JSON array of per-endpoint payment requirements (see below). When set, takes full precedence over `REQUEST_PRICE` and `SOROBAN_TOKEN_ID`. |
+
+### Configuring protected endpoints
+
+Each protected route can define its own price and accepted token. Set
+`ENDPOINT_REQUIREMENTS` to a JSON array — one object per route:
+
+```json
+[
+  {
+    "path": "/paid/data",
+    "amount": "100",
+    "tokenAddress": "C...",
+    "description": "Metered data endpoint",
+    "mimeType": "application/json"
+  },
+  {
+    "path": "/paid/premium",
+    "amount": "500",
+    "tokenAddress": "C...",
+    "description": "Premium analytics endpoint",
+    "mimeType": "application/json"
+  }
+]
+```
+
+In your `.env` file, write it as a single line:
+
+```env
+ENDPOINT_REQUIREMENTS=[{"path":"/paid/data","amount":"100","tokenAddress":"C...","description":"Metered data endpoint","mimeType":"application/json"}]
+```
+
+Field rules (validated at startup — the server refuses to start on any error):
+
+| Field | Required | Constraints |
+| --- | --- | --- |
+| `path` | yes | Must start with `/` |
+| `amount` | yes | Positive integer string; no leading zeros; minimum `"1"` |
+| `tokenAddress` | yes | Non-empty Stellar contract address string (`C...`) |
+| `description` | yes | Non-empty string; included in the HTTP 402 response body |
+| `mimeType` | yes | Non-empty string; included in the HTTP 402 response body |
+
+Duplicate paths are rejected. When `ENDPOINT_REQUIREMENTS` is absent or empty, the server falls back to the legacy single-route mode using `REQUEST_PRICE` and `SOROBAN_TOKEN_ID` for the built-in `/paid/data` route.
 
 Set the corresponding `NEXT_PUBLIC_SOROBAN_CONTRACT_ID`,
 `NEXT_PUBLIC_SOROBAN_TOKEN_ID`, `NEXT_PUBLIC_PAY_TO`,
