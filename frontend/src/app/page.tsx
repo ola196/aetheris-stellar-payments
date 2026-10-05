@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Contract,
   Networks,
@@ -11,6 +11,13 @@ import { contract } from "@stellar/stellar-sdk";
 import { requestAccess, signAuthEntry, signTransaction } from "@stellar/freighter-api";
 import { openChannelArgsToScVal } from "@/lib/channel";
 import { createVoucherSigner, signVoucher, type VoucherSigner } from "@/lib/voucher";
+import {
+  clearVoucher,
+  listStoredVouchers,
+  loadVoucher,
+  saveVoucher,
+  type PersistedVoucher,
+} from "@/lib/voucher-store";
 
 const RPC_URL = "https://soroban-testnet.stellar.org";
 const PRICE = BigInt(process.env.NEXT_PUBLIC_REQUEST_PRICE ?? "100");
@@ -33,23 +40,34 @@ interface SettlementMethods {
     valid_until: bigint;
     signature: Uint8Array;
   }) => Promise<contract.AssembledTransaction<bigint>>;
+  refund: (args: { id: bigint }) => Promise<contract.AssembledTransaction<bigint>>;
 }
 
 export default function Home() {
   const [wallet, setWallet] = useState("");
   const [channelId, setChannelId] = useState("");
+  const [channelExpiresAt, setChannelExpiresAt] = useState(0n);
   const [status, setStatus] = useState<Status>("idle");
   const [message, setMessage] = useState("");
   const [calls, setCalls] = useState(0);
   const [voucherSigner, setVoucherSigner] = useState<VoucherSigner | null>(null);
   const [latestVoucher, setLatestVoucher] = useState<SignedVoucher | null>(null);
   const [settledAmount, setSettledAmount] = useState(0n);
+  const [recoveredVouchers, setRecoveredVouchers] = useState<PersistedVoucher[]>([]);
 
   const contractId = process.env.NEXT_PUBLIC_SOROBAN_CONTRACT_ID ?? "";
   const tokenId = process.env.NEXT_PUBLIC_SOROBAN_TOKEN_ID ?? "";
   const payTo = process.env.NEXT_PUBLIC_PAY_TO ?? "";
   const apiUrl =
     process.env.NEXT_PUBLIC_PAID_API_URL ?? "http://localhost:4020/paid/data";
+
+  // On mount, surface any vouchers stored from previous sessions.
+  useEffect(() => {
+    setRecoveredVouchers(listStoredVouchers());
+  }, []);
+
+  const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
+  const channelExpired = channelExpiresAt > 0n && channelExpiresAt <= nowSeconds;
 
   async function connectWallet() {
     setStatus("working");
@@ -80,7 +98,7 @@ export default function Home() {
       const expiresAt = BigInt(Math.floor(Date.now() / 1000) + 86_400);
       const server = new rpc.Server(RPC_URL);
       const account = await server.getAccount(wallet);
-      const contract = new Contract(contractId);
+      const contractInstance = new Contract(contractId);
       const args = openChannelArgsToScVal({
         id,
         payer: wallet,
@@ -90,7 +108,7 @@ export default function Home() {
         deposit: DEPOSIT,
         expires_at: expiresAt,
       });
-      const operation = contract.call("open_channel", args);
+      const operation = contractInstance.call("open_channel", args);
       const transaction = new TransactionBuilder(account, {
         fee: "100",
         networkPassphrase: Networks.TESTNET,
@@ -121,12 +139,13 @@ export default function Home() {
       }
       await waitForTransaction(server, submitted.hash);
       setChannelId(id.toString());
+      setChannelExpiresAt(expiresAt);
       setVoucherSigner(signer);
       setLatestVoucher(null);
       setSettledAmount(0n);
       setCalls(0);
       setStatus("success");
-      setMessage(`Channel ${id.toString()} opened. Voucher key stays in this tab's memory.`);
+      setMessage(`Channel ${id.toString()} opened. Delegate signing key is in this tab's memory only.`);
     } catch (error) {
       setStatus("error");
       setMessage(errorMessage(error));
@@ -191,13 +210,28 @@ export default function Home() {
       if (!response.ok) {
         throw new Error(body.error ?? `API returned ${response.status}`);
       }
-      setLatestVoucher({
+
+      const newVoucher: SignedVoucher = {
         amount: cumulativeAmount,
         nonce,
         validUntil,
         signature,
-      });
+      };
+      setLatestVoucher(newVoucher);
       setCalls(Number(nonce));
+
+      // Persist the latest voucher so the payee can settle after a page refresh.
+      // The signing key is NOT stored — only the self-contained signed fields.
+      saveVoucher({
+        channelId,
+        amount: cumulativeAmount.toString(),
+        nonce: nonce.toString(),
+        validUntil: validUntil.toString(),
+        signature,
+        savedAt: new Date().toISOString(),
+      });
+      setRecoveredVouchers(listStoredVouchers());
+
       setStatus("success");
       setMessage(JSON.stringify(body));
     } catch (error) {
@@ -207,14 +241,38 @@ export default function Home() {
   }
 
   async function settleLatestVoucher() {
+    if (!channelId || !latestVoucher) return;
+    await settleVoucher(
+      channelId,
+      latestVoucher.amount,
+      latestVoucher.nonce,
+      latestVoucher.validUntil,
+      latestVoucher.signature,
+    );
+  }
+
+  async function settleRecoveredVoucher(v: PersistedVoucher) {
+    await settleVoucher(
+      v.channelId,
+      BigInt(v.amount),
+      BigInt(v.nonce),
+      BigInt(v.validUntil),
+      v.signature,
+    );
+  }
+
+  async function settleVoucher(
+    cId: string,
+    amount: bigint,
+    nonce: bigint,
+    validUntil: bigint,
+    signature: string,
+  ) {
     setStatus("working");
     try {
       if (!wallet) throw new Error("Connect the payee's Freighter account to settle");
       if (wallet !== payTo) {
         throw new Error("Switch Freighter to the configured payee account before settling");
-      }
-      if (!channelId || !latestVoucher) {
-        throw new Error("There is no outstanding signed voucher to settle");
       }
       const client = await contract.Client.from<SettlementMethods>({
         contractId,
@@ -251,18 +309,81 @@ export default function Home() {
         },
       });
       const transaction = await client.settle({
-        id: BigInt(channelId),
-        amount: latestVoucher.amount,
-        nonce: latestVoucher.nonce,
-        valid_until: latestVoucher.validUntil,
-        signature: fromHex(latestVoucher.signature),
+        id: BigInt(cId),
+        amount,
+        nonce,
+        valid_until: validUntil,
+        signature: fromHex(signature),
       });
       const submitted = await transaction.signAndSend();
-      setSettledAmount(latestVoucher.amount);
-      setLatestVoucher(null);
+      // On successful settlement remove the voucher from storage.
+      clearVoucher(cId);
+      setRecoveredVouchers(listStoredVouchers());
+      if (cId === channelId) {
+        setSettledAmount(amount);
+        setLatestVoucher(null);
+      }
       setStatus("success");
       setMessage(
-        `Settled ${latestVoucher.amount.toString()} token units on Stellar Testnet. Transaction: ${submitted.sendTransactionResponse?.hash ?? "confirmed"}`,
+        `Settled ${amount.toString()} token units on Stellar Testnet. Transaction: ${submitted.sendTransactionResponse?.hash ?? "confirmed"}`,
+      );
+    } catch (error) {
+      setStatus("error");
+      setMessage(errorMessage(error));
+    }
+  }
+
+  async function refundExpiredChannel(cId: string) {
+    setStatus("working");
+    try {
+      if (!wallet) throw new Error("Connect Freighter to refund the channel");
+      const client = await contract.Client.from<SettlementMethods>({
+        contractId,
+        networkPassphrase: Networks.TESTNET,
+        rpcUrl: RPC_URL,
+        publicKey: wallet,
+        signTransaction: async (transactionXdr, options) => {
+          const result = await signTransaction(transactionXdr, {
+            networkPassphrase: options?.networkPassphrase ?? Networks.TESTNET,
+            address: wallet,
+          });
+          if (result.error) throw new Error(result.error.message);
+          if (!result.signedTxXdr) {
+            throw new Error("Freighter returned no signed refund transaction");
+          }
+          return {
+            signedTxXdr: result.signedTxXdr,
+            signerAddress: result.signerAddress,
+          };
+        },
+        signAuthEntry: async (entryXdr, options) => {
+          const result = await signAuthEntry(entryXdr, {
+            networkPassphrase: options?.networkPassphrase ?? Networks.TESTNET,
+            address: wallet,
+          });
+          if (result.error) throw new Error(result.error.message);
+          if (!result.signedAuthEntry) {
+            throw new Error("Freighter returned no signed Soroban authorization");
+          }
+          return {
+            signedAuthEntry: result.signedAuthEntry,
+            signerAddress: result.signerAddress,
+          };
+        },
+      });
+      const transaction = await client.refund({ id: BigInt(cId) });
+      const submitted = await transaction.signAndSend();
+      clearVoucher(cId);
+      setRecoveredVouchers(listStoredVouchers());
+      if (cId === channelId) {
+        setChannelId("");
+        setChannelExpiresAt(0n);
+        setLatestVoucher(null);
+        setVoucherSigner(null);
+      }
+      setStatus("success");
+      setMessage(
+        `Refund submitted for channel ${cId}. Transaction: ${submitted.sendTransactionResponse?.hash ?? "confirmed"}`,
       );
     } catch (error) {
       setStatus("error");
@@ -297,6 +418,76 @@ export default function Home() {
         </div>
       </section>
 
+      {/* Recovery panel — shown when vouchers were found in localStorage */}
+      {recoveredVouchers.length > 0 && (
+        <section className="workspace">
+          <div className="section-heading">
+            <div>
+              <span className="section-index">RECOVERY / UNSETTLED VOUCHERS</span>
+              <h2>Recover from a previous session</h2>
+            </div>
+          </div>
+          <p className="muted" style={{ marginBottom: "1rem" }}>
+            The following signed vouchers were saved locally before the page was last closed.
+            The signing key is gone, so new calls cannot be signed for these channels.
+            The payee can still settle the vouchers below, or the payer can refund after expiry.
+            See <a href="https://github.com/your-org/aetheris-stellar-payments/blob/main/docs/voucher-recovery.md" target="_blank" rel="noreferrer">voucher-recovery.md</a> for details.
+          </p>
+          <div className="card-grid">
+            {recoveredVouchers.map((v) => {
+              const nowSec = Math.floor(Date.now() / 1000);
+              const expired = Number(v.validUntil) <= nowSec;
+              return (
+                <article key={v.channelId} className="panel">
+                  <div className="panel-label">STORED VOUCHER</div>
+                  <div className="detail-row"><span>Channel</span><span>{v.channelId}</span></div>
+                  <div className="detail-row"><span>Amount</span><span>{v.amount} units</span></div>
+                  <div className="detail-row"><span>Nonce</span><span>{v.nonce}</span></div>
+                  <div className="detail-row">
+                    <span>Valid until</span>
+                    <span>{new Date(Number(v.validUntil) * 1000).toLocaleString()}</span>
+                  </div>
+                  <div className="detail-row"><span>Saved</span><span>{new Date(v.savedAt).toLocaleString()}</span></div>
+                  <div className="divider" />
+                  {expired ? (
+                    <>
+                      <p className="hint" style={{ color: "var(--error, #e55)" }}>
+                        Voucher has expired. Settlement is no longer possible for this voucher.
+                        If the channel&apos;s own expiry has also passed, the payer can refund.
+                      </p>
+                      <button
+                        className="primary-button"
+                        disabled={status === "working" || !wallet}
+                        onClick={() => refundExpiredChannel(v.channelId)}
+                      >
+                        Refund expired channel <span>↗</span>
+                      </button>
+                      <p className="hint">Payer account must be active in Freighter.</p>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        className="settle-button"
+                        disabled={status === "working" || !wallet || wallet !== payTo}
+                        onClick={() => settleRecoveredVoucher(v)}
+                      >
+                        {wallet === payTo
+                          ? `Settle ${v.amount} units`
+                          : "Connect payee wallet to settle"}
+                        <span>↗</span>
+                      </button>
+                      <p className="hint">
+                        Switch Freighter to the payee account ({payTo ? `${payTo.slice(0, 8)}…${payTo.slice(-5)}` : "not configured"}) to enable settlement.
+                      </p>
+                    </>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
       <section className="workspace">
         <div className="section-heading">
           <div><span className="section-index">01 / CHANNEL</span><h2>Your payment rail</h2></div>
@@ -315,11 +506,36 @@ export default function Home() {
             <div className="detail-row"><span>Payee</span><span>{payTo ? `${payTo.slice(0, 8)}...${payTo.slice(-5)}` : "Not configured"}</span></div>
             <div className="detail-row"><span>Deposit</span><span>{DEPOSIT.toString()} token units</span></div>
             <div className="detail-row"><span>Request price</span><span>{PRICE.toString()} token units</span></div>
+            {channelExpiresAt > 0n && (
+              <div className="detail-row">
+                <span>Expires</span>
+                <span>{new Date(Number(channelExpiresAt) * 1000).toLocaleString()}</span>
+              </div>
+            )}
             <button className="primary-button" disabled={status === "working" || Boolean(channelId)} onClick={openChannel}>
               {channelId ? "Channel opened" : status === "working" ? "Waiting for wallet..." : "Open channel"}
               <span>↗</span>
             </button>
-            <p className="hint">Freighter confirms the Testnet transaction. A temporary delegate key signs usage vouchers.</p>
+            <p className="hint">
+              Freighter confirms the Testnet transaction. A temporary delegate key signs usage
+              vouchers — it lives only in this tab. Signed vouchers are saved locally so the
+              payee can settle even after a page refresh.
+            </p>
+            {channelId && channelExpired && (
+              <>
+                <div className="divider" />
+                <p className="hint" style={{ color: "var(--error, #e55)" }}>
+                  This channel has expired. The payer can recover unclaimed escrow.
+                </p>
+                <button
+                  className="primary-button"
+                  disabled={status === "working" || !wallet}
+                  onClick={() => refundExpiredChannel(channelId)}
+                >
+                  Refund expired channel <span>↗</span>
+                </button>
+              </>
+            )}
           </article>
 
           <article className="panel request-panel">
@@ -336,7 +552,7 @@ export default function Home() {
               <div><span className="section-index">VOUCHERS SIGNED</span><strong>{String(calls).padStart(2, "0")}</strong></div>
               <div><span className="section-index">TOTAL AUTHORIZED</span><strong>{(BigInt(calls) * PRICE).toString()} <small>units</small></strong></div>
             </div>
-            <button className="secondary-button" disabled={status === "working" || !channelId} onClick={callPaidApi}>
+            <button className="secondary-button" disabled={status === "working" || !channelId || !voucherSigner} onClick={callPaidApi}>
               {status === "working" ? "Signing & requesting..." : "Call the paid API"} <span>→</span>
             </button>
             <div className="settlement-box">
@@ -364,6 +580,8 @@ export default function Home() {
             <p className="hint">
               Vouchers are off-chain until the configured payee submits the latest claim in Freighter.
               {wallet !== payTo ? " Switch Freighter to the payee account, then reconnect to settle." : ""}
+              {" "}Each signed voucher is saved locally — if you refresh the page, open the recovery
+              panel above to settle the last saved voucher without needing to re-sign.
             </p>
           </article>
         </div>
