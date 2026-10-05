@@ -45,6 +45,11 @@ scheme registration.
 - Channel expiry is capped at 30 days. The contract extends entry TTL on calls,
   but only submitted transactions commit a TTL extension; read-only RPC
   simulations do not.
+- After channel expiry the payer (and only the payer) can recover the unsettled
+  balance by calling `refund`. The dashboard shows expiry time, a countdown,
+  and the split between settled and remaining escrow amounts to make this clear.
+  See [expiry-and-refund.md](./expiry-and-refund.md) for the full user-facing
+  description and error reference.
 - SQLite is an atomic single-host replay cursor. Multi-instance production
   deployments need a shared transactional store (for example PostgreSQL) and
   operational monitoring.
