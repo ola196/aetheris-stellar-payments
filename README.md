@@ -173,6 +173,117 @@ admin defaults to that identity's public address. The script prints the
 contract ID to copy into both local environment files. It does not create a
 token, fund accounts, or write credentials to the repository.
 
+## Reviewer walkthrough
+
+This walkthrough reproduces the full Testnet payment flow from a fresh browser
+tab. Complete the [Local configuration](#local-configuration) and
+[Testnet deployment](#testnet-deployment) steps first, then start both the
+server and frontend dev processes.
+
+> **Keep the browser tab open** throughout the walkthrough. The delegate
+> signing key lives only in page memory; closing or refreshing the tab discards
+> it and new API calls cannot be signed for that channel. Signed vouchers are
+> saved to `localStorage` so the payee can still settle after a reload via the
+> recovery panel, but the signing key itself is never stored anywhere.
+
+### Step 1 — Connect Freighter
+
+1. Open `http://localhost:3000` in a Chromium-based browser with the Freighter
+   extension installed and unlocked on **Stellar Testnet**.
+2. Click **Connect Freighter** in the top-right corner.
+3. Approve the connection in the Freighter popup.
+
+**Expected dashboard state:** the top-right button changes from
+`Connect Freighter` to a truncated address (`GXXXX…XXXXX`). The status banner
+reads *"Freighter connected on Stellar Testnet."*
+
+---
+
+### Step 2 — Open a payment channel
+
+1. In the **Your payment rail** panel, confirm the wallet address, payee, and
+   deposit amount are shown correctly.
+2. Click **Open channel**.
+3. Freighter will prompt you to sign and submit a Soroban `open_channel`
+   transaction on Testnet. Approve it.
+4. Wait for the transaction to be confirmed (the dashboard polls Soroban RPC
+   for up to 30 seconds).
+
+**Expected dashboard state:** the channel metric changes from **NOT OPEN** to
+**ACTIVE**, a channel ID and expiry timestamp appear, and the **Open channel**
+button becomes disabled. The status banner reads *"Channel `<id>` opened.
+Delegate signing key is in this tab's memory only."*
+
+> The delegate Ed25519 key pair is generated ephemerally in the browser. Its
+> public key was bound to the channel on-chain during `open_channel`. The
+> **private key exists only in this tab's JavaScript memory** — it is never
+> written to disk, `localStorage`, or sent over the network.
+
+---
+
+### Step 3 — Call the paid API
+
+1. In the **HTTP 402 FLOW** panel, click **Call the paid API**.
+2. The dashboard sends an unauthenticated `GET /paid/data`, receives `HTTP 402`
+   with a `PAYMENT-REQUIRED` header, signs a cumulative Ed25519 voucher
+   off-chain, and retries with `PAYMENT-SIGNATURE`.
+3. Repeat for as many calls as you like; each call increments the cumulative
+   voucher amount.
+
+**Expected dashboard state after each call:** the **Vouchers signed** counter
+increments, **Total authorized** shows the running cumulative amount in token
+units, and the status banner displays the JSON response body from the API.
+The **Settle** button in the settlement box activates (if Freighter is already
+on the payee account) or shows *"Connect payee wallet"* otherwise.
+
+---
+
+### Step 4 — Settle the voucher on-chain
+
+Settlement is a payee action. The configured payee address is shown in the
+channel panel (truncated `G…` address).
+
+1. In Freighter, switch to the **payee account** that matches `NEXT_PUBLIC_PAY_TO`.
+2. Click **Connect Freighter** again (the top-right button) so the dashboard
+   picks up the new active account.
+3. In the settlement box, the **Settle `<amount>` units** button is now active.
+   Click it.
+4. Approve the Soroban `settle` transaction in Freighter.
+
+**Expected dashboard state:** the **On-chain settlement** counter updates to
+the settled amount, the outstanding voucher is cleared, and the status banner
+shows *"Settled `<amount>` token units on Stellar Testnet. Transaction:
+`<hash>`."*
+
+---
+
+### Step 5 — Confirm on Stellar Testnet Explorer
+
+Copy the transaction hash from the status banner and open it in
+[Stellar Expert (Testnet)](https://stellar.expert/explorer/testnet) or
+[Stellar Lab](https://laboratory.stellar.org/#explorer?network=test):
+
+```
+https://stellar.expert/explorer/testnet/tx/<hash>
+```
+
+Verify that the transaction was applied and the contract's escrow balance
+decreased by the settled amount.
+
+---
+
+### Ephemeral key and recovery notes
+
+- The delegate private key is **temporary** — it does not persist across page
+  reloads. Only open channels with Testnet funds you are willing to leave locked
+  until channel expiry if the tab is accidentally closed before settlement.
+- Each successful API call overwrites the previous voucher in `localStorage`
+  (vouchers are cumulative; only the latest matters). If the page is reloaded,
+  the **RECOVERY / UNSETTLED VOUCHERS** panel appears automatically with any
+  saved voucher; the payee can settle directly from there without re-signing.
+- After channel expiry the payer can reclaim the unclaimed escrow via the
+  **Refund expired channel** button, which calls `refund` on the contract.
+
 ## Security and limitations
 
 - Soroban checks payer authorization for deposits, payee authorization for
